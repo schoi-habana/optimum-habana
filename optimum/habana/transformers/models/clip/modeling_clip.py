@@ -90,15 +90,18 @@ class GaudiCLIPAttention(CLIPAttention):
         attn_weights_reshaped = None
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scale
-        key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
+        key_states = self._shape(self.k_proj(hidden_states), -1, bsz) #[5,2,577,64]
         value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
-        proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
+        #print(f"*****************self.num_heads:{self.num_heads}, self.head_dim:{self.head_dim}, query_states shape:{query_states.shape}")
+        #8x: num_heads 2, head_dim 64, [5, 577, 128] #heads are split across 8x
+        #1x: num_heads 16, head_dim 64, [5,577, 1024] (bs, tgt_len, hidden_size)
+        proj_shape = (bsz * self.num_heads, -1, self.head_dim) #(5*2, 577, 64) #actual shape [5,577,128]
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape) #(5*2, 577, 64)
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
 
-        src_len = key_states.size(1)
+        src_len = key_states.size(1) #577
         if FusedSDPA and use_flash_attention:
             import habana_frameworks.torch.hpu as ht
 
@@ -154,9 +157,11 @@ class GaudiCLIPAttention(CLIPAttention):
                 f" {attn_output.size()}"
             )
 
-        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, tgt_len, embed_dim)
+        #8x: num_heads 2, head_dim 64, [5, 577, 128] #heads are split across 8x
+        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim) #5,2,577,64
+        attn_output = attn_output.transpose(1, 2) #5,577,2,64
+        #attn_output = attn_output.reshape(bsz, tgt_len, embed_dim) #5, 577, 128
+        attn_output = attn_output.reshape(bsz, tgt_len, -1)
 
         attn_output = self.out_proj(attn_output)
 

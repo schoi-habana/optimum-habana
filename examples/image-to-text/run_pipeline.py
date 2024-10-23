@@ -36,6 +36,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def override_print(enable):
+    import builtins as __builtin__
+
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop("force", False)
+        if force or enable:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
+
+def override_logger(logger, enable):
+    logger_info = logger.info
+
+    def info(*args, **kwargs):
+        force = kwargs.pop("force", False)
+        if force or enable:
+            logger_info(*args, **kwargs)
+
+    logger.info = info
+
 def setup_quantization(model, args):
     from neural_compressor.torch.quantization import FP8Config, convert, prepare
 
@@ -129,6 +151,11 @@ def main():
 
     # set args.quant_config with env variable if it is set
     args.quant_config = os.getenv("QUANT_CONFIG", "")
+
+    args.local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    args.world_size = int(os.getenv("WORLD_SIZE", "0"))
+    args.global_rank = int(os.getenv("RANK", "0"))
+
     os.environ.setdefault("EXPERIMENTAL_WEIGHT_SHARING", "FALSE")
     adapt_transformers_to_gaudi()
 
@@ -181,12 +208,47 @@ def main():
 
         htcore.hpu_set_env()
 
+    ########sc
+
+    #os.environ.setdefault("PT_HPU_LAZY_ACC_PAR_MODE", "0")
+    #os.environ.setdefault("PT_HPU_ENABLE_LAZY_COLLECTIVES", "TRUE")#"true")
+
+
     generator = pipeline(
         "image-to-text",
         model=args.model_name_or_path,
         torch_dtype=model_dtype,
         device="hpu",
     )
+
+    #############sc
+    if args.world_size > 1:
+        override_print(args.global_rank == 0)
+        override_logger(logger, args.global_rank == 0)
+
+        import deepspeed
+
+        logger.info("DeepSpeed is enabled.")
+        deepspeed.init_distributed(dist_backend="hccl")
+        generator.model.eval()
+
+        ds_inference_kwargs = {"dtype": model_dtype}
+        ds_inference_kwargs["tensor_parallel"] = {"tp_size": args.world_size}
+        ds_inference_kwargs["enable_cuda_graph"] = args.use_hpu_graphs
+        #ds_inference_kwargs["injection_policy"] = {}#get_ds_injection_policy(config)
+
+        generator.model = deepspeed.init_inference(generator.model, **ds_inference_kwargs).module
+
+    else:
+        if args.use_hpu_graphs:
+            from habana_frameworks.torch.hpu import wrap_in_hpu_graph
+
+            generator.model = wrap_in_hpu_graph(generator.model)
+
+
+    ###########sc
+
+
     generate_kwargs = {
         "lazy_mode": True,
         "hpu_graphs": args.use_hpu_graphs,
@@ -197,11 +259,6 @@ def main():
     }
     if args.use_kv_cache:
         generate_kwargs["use_cache"] = args.use_kv_cache
-
-    if args.use_hpu_graphs:
-        from habana_frameworks.torch.hpu import wrap_in_hpu_graph
-
-        generator.model = wrap_in_hpu_graph(generator.model)
 
     if args.quant_config:
         generator.model = setup_quantization(generator.model, args)
